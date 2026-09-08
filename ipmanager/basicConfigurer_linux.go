@@ -1,6 +1,7 @@
 package ipmanager
 
 import (
+	"fmt"
 	"net"
 	"os/exec"
 	"syscall"
@@ -12,6 +13,10 @@ func htons(i uint16) uint16 {
 }
 
 func sendPacketLinux(iface net.Interface, packetData []byte) error {
+	return sendPacketLinuxWithProtocol(iface, packetData, syscall.ETH_P_ARP)
+}
+
+func sendPacketLinuxWithProtocol(iface net.Interface, packetData []byte, protocol uint16) error {
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_ALL)))
 	if err != nil {
 		return err
@@ -19,10 +24,10 @@ func sendPacketLinux(iface net.Interface, packetData []byte) error {
 	defer syscall.Close(fd)
 
 	var sll syscall.SockaddrLinklayer
-	sll.Protocol = htons(syscall.ETH_P_ARP)
+	sll.Protocol = htons(protocol)
 	sll.Ifindex = iface.Index
 	sll.Hatype = syscall.ARPHRD_ETHER
-	sll.Pkttype = syscall.PACKET_BROADCAST
+	sll.Pkttype = syscall.PACKET_HOST
 
 	if err = syscall.Bind(fd, &sll); err != nil {
 		return err
@@ -31,15 +36,51 @@ func sendPacketLinux(iface net.Interface, packetData []byte) error {
 	return syscall.Sendto(fd, packetData, 0, &sll)
 }
 
+func (c *BasicConfigurer) linkLocalAddress() (net.IP, error) {
+	iface, err := net.InterfaceByName(c.Iface.Name)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch value := addr.(type) {
+		case *net.IPNet:
+			ip = value.IP
+		case *net.IPAddr:
+			ip = value.IP
+		}
+		if ip != nil && ip.To4() == nil && ip.IsLinkLocalUnicast() {
+			return ip, nil
+		}
+	}
+	return nil, fmt.Errorf("interface %s has no IPv6 link-local address", c.Iface.Name)
+}
+
 // configureAddress assigns virtual IP address
 func (c *BasicConfigurer) configureAddress() bool {
 	log.Infof("Configuring address %s on %s", c.getCIDR(), c.Iface.Name)
 	result := c.runAddressConfiguration("add")
 	if result {
-		if buff, err := c.createGratuitousARP(); err != nil {
-			log.Warn("Failed to compose gratuitous ARP request: ", err)
+		if c.VIP.Is6() {
+			sourceIP, err := c.linkLocalAddress()
+			if err != nil {
+				log.Warn("Failed to find IPv6 link-local address for Neighbor Advertisement: ", err)
+				return result
+			}
+			buff, err := c.createGratuitousNA(sourceIP)
+			if err != nil {
+				log.Warn("Failed to compose unsolicited Neighbor Advertisement: ", err)
+			} else if err := sendPacketLinuxWithProtocol(c.Iface, buff, syscall.ETH_P_IPV6); err != nil {
+				log.Warn("Failed to send unsolicited Neighbor Advertisement: ", err)
+			}
 		} else {
-			if err := sendPacketLinux(c.Iface, buff); err != nil {
+			if buff, err := c.createGratuitousARP(); err != nil {
+				log.Warn("Failed to compose gratuitous ARP request: ", err)
+			} else if err := sendPacketLinux(c.Iface, buff); err != nil {
 				log.Warn("Failed to send gratuitous ARP request: ", err)
 			}
 		}

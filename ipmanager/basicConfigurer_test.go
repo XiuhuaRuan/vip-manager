@@ -246,3 +246,56 @@ func TestBasicConfigurer_createGratuitousARP(t *testing.T) {
 		t.Errorf("ARP destination protocol address = %v, want %v", arp.DstProtAddress, c.VIP.AsSlice())
 	}
 }
+
+func TestBasicConfigurer_createGratuitousNA(t *testing.T) {
+	t.Parallel()
+
+	c := &BasicConfigurer{
+		IPConfiguration: &IPConfiguration{
+			VIP: netip.MustParseAddr("2001:db8::10"),
+			Iface: net.Interface{
+				HardwareAddr: net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
+			},
+		},
+	}
+	sourceIP := net.ParseIP("fe80::1")
+
+	packet, err := c.createGratuitousNA(sourceIP)
+	if err != nil {
+		t.Fatalf("createGratuitousNA() error = %v", err)
+	}
+
+	parsed := gopacket.NewPacket(packet, layers.LayerTypeEthernet, gopacket.Default)
+	eth := parsed.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
+	wantMulticast := net.HardwareAddr{0x33, 0x33, 0x00, 0x00, 0x00, 0x01}
+	if !bytes.Equal(eth.DstMAC, wantMulticast) {
+		t.Errorf("Ethernet destination MAC = %v, want %v", eth.DstMAC, wantMulticast)
+	}
+	if eth.EthernetType != layers.EthernetTypeIPv6 {
+		t.Errorf("Ethernet type = %v, want IPv6", eth.EthernetType)
+	}
+
+	ipv6 := parsed.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
+	if ipv6.HopLimit != 255 {
+		t.Errorf("IPv6 hop limit = %d, want 255", ipv6.HopLimit)
+	}
+	if !ipv6.SrcIP.Equal(sourceIP) || !ipv6.DstIP.Equal(net.ParseIP("ff02::1")) {
+		t.Errorf("IPv6 addresses = %s -> %s, want %s -> ff02::1", ipv6.SrcIP, ipv6.DstIP, sourceIP)
+	}
+
+	icmp := parsed.Layer(layers.LayerTypeICMPv6).(*layers.ICMPv6)
+	if icmp.TypeCode.Type() != layers.ICMPv6TypeNeighborAdvertisement {
+		t.Errorf("ICMPv6 type = %v, want Neighbor Advertisement", icmp.TypeCode.Type())
+	}
+	na := parsed.Layer(layers.LayerTypeICMPv6NeighborAdvertisement).(*layers.ICMPv6NeighborAdvertisement)
+	if na.Flags != 0x20 {
+		t.Errorf("NA flags = 0x%x, want Override flag 0x20", na.Flags)
+	}
+	if !net.IP(na.TargetAddress).Equal(c.VIP.AsSlice()) {
+		t.Errorf("NA target = %s, want %s", na.TargetAddress, c.VIP)
+	}
+	if len(na.Options) != 1 || na.Options[0].Type != layers.ICMPv6OptTargetAddress ||
+		!bytes.Equal(na.Options[0].Data, c.Iface.HardwareAddr) {
+		t.Errorf("NA target link-layer option = %#v, want interface MAC", na.Options)
+	}
+}
