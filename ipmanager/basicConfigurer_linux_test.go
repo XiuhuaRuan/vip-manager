@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"syscall"
 	"testing"
 
@@ -211,6 +212,147 @@ func TestSendPacketLinux_EmptyPacket(t *testing.T) {
 	// May succeed or fail, but should not panic
 	if err != nil {
 		t.Logf("sendPacketLinux with empty packet returned: %v", err)
+	}
+}
+
+func TestBasicConfigurer_linkLocalAddress(t *testing.T) {
+	t.Parallel()
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("failed to get interfaces: %v", err)
+	}
+
+	for i := range ifaces {
+		iface := ifaces[i]
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err != nil || ip == nil || ip.To4() != nil || !ip.IsLinkLocalUnicast() {
+				continue
+			}
+
+			c := &BasicConfigurer{
+				IPConfiguration: &IPConfiguration{Iface: iface},
+			}
+			got, err := c.linkLocalAddress()
+			if err != nil {
+				t.Fatalf("linkLocalAddress() error for %s: %v", iface.Name, err)
+			}
+			if !got.Equal(ip) {
+				t.Fatalf("linkLocalAddress() = %s, want %s", got, ip)
+			}
+			return
+		}
+	}
+
+	t.Skip("no IPv6 link-local address available on this machine")
+}
+
+func TestBasicConfigurer_linkLocalAddress_MissingInterface(t *testing.T) {
+	t.Parallel()
+
+	c := &BasicConfigurer{
+		IPConfiguration: &IPConfiguration{
+			Iface: net.Interface{Name: "definitely-not-a-real-interface"},
+		},
+	}
+
+	_, err := c.linkLocalAddress()
+	if err == nil {
+		t.Fatal("linkLocalAddress() expected an error for a missing interface, got nil")
+	}
+}
+
+func mockLogger(t *testing.T) {
+	old := log
+	log = zap.NewNop().Sugar()
+	t.Cleanup(func() { log = old })
+}
+
+func mockExecCommand(t *testing.T, fn func(string, ...string) *exec.Cmd) {
+	old := execCommand
+	execCommand = fn
+	t.Cleanup(func() { execCommand = old })
+}
+
+func mockIPv6Send(t *testing.T, fn func(net.Interface, []byte, uint16) error) {
+	old := linuxSendPacketWithProtocolFn
+	linuxSendPacketWithProtocolFn = fn
+	t.Cleanup(func() { linuxSendPacketWithProtocolFn = old })
+}
+
+func TestBasicConfigurer_configureAddress_IPv6(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		iface     net.Interface
+		wantSend  bool
+		sendCheck func(net.Interface, []byte, uint16) error
+	}{
+		{
+			name:     "success",
+			iface:    net.Interface{Name: "lo"},
+			wantSend: true,
+			sendCheck: func(iface net.Interface, packetData []byte, protocol uint16) error {
+				if protocol != syscall.ETH_P_IPV6 {
+					t.Fatalf("wrong protocol: got %d want %d", protocol, syscall.ETH_P_IPV6)
+				}
+				return nil
+			},
+		},
+		{
+			name:     "no-link-local",
+			iface:    net.Interface{Name: "loopback-test"},
+			wantSend: false,
+			sendCheck: func(iface net.Interface, packetData []byte, protocol uint16) error {
+				t.Fatal("send should not be called when no IPv6 link-local address is available")
+				return nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockLogger(t)
+			mockExecCommand(t, func(name string, args ...string) *exec.Cmd { return exec.Command("true") })
+			mockIPv6Send(t, tt.sendCheck)
+
+			c := &BasicConfigurer{
+				IPConfiguration: &IPConfiguration{
+					VIP:     netip.MustParseAddr("2001:db8::10"),
+					Netmask: net.CIDRMask(64, 128),
+					Iface:   tt.iface,
+				},
+			}
+
+			if !c.configureAddress() {
+				t.Fatal("configureAddress() = false, want true")
+			}
+		})
+	}
+}
+
+func TestBasicConfigurer_runAddressConfiguration_ErrorExit(t *testing.T) {
+	mockLogger(t)
+	mockExecCommand(t, func(name string, args ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", "exit 1")
+	})
+
+	c := &BasicConfigurer{
+		IPConfiguration: &IPConfiguration{
+			VIP:     netip.MustParseAddr("2001:db8::10"),
+			Netmask: net.CIDRMask(64, 128),
+			Iface:   net.Interface{Name: "lo"},
+		},
+	}
+
+	if c.runAddressConfiguration("add") {
+		t.Fatal("runAddressConfiguration() = true, want false")
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 // that handle their own network connection, in setups where it is
 // sufficient to add the virtual ip using `ip addr add ...` .
 // After adding the virtual ip to the specified interface,
-// a gratuitous ARP package is sent out to update the tables of
+// a gratuitous ARP package or IPv6 Neighbor Advertisement is sent out to update the tables of
 // nearby routers and other devices.
 type BasicConfigurer struct {
 	*IPConfiguration

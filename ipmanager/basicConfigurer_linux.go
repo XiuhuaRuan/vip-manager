@@ -7,6 +7,9 @@ import (
 	"syscall"
 )
 
+var execCommand = exec.Command
+var linuxSendPacketWithProtocolFn = sendPacketLinuxWithProtocol
+
 // htons converts uint16 to network byte order
 func htons(i uint16) uint16 {
 	return (i<<8)&0xff00 | i>>8
@@ -74,7 +77,7 @@ func (c *BasicConfigurer) configureAddress() bool {
 			buff, err := c.createGratuitousNA(sourceIP)
 			if err != nil {
 				log.Warn("Failed to compose unsolicited Neighbor Advertisement: ", err)
-			} else if err := sendPacketLinuxWithProtocol(c.Iface, buff, syscall.ETH_P_IPV6); err != nil {
+			} else if err := linuxSendPacketWithProtocolFn(c.Iface, buff, syscall.ETH_P_IPV6); err != nil {
 				log.Warn("Failed to send unsolicited Neighbor Advertisement: ", err)
 			}
 		} else {
@@ -96,7 +99,7 @@ func (c *BasicConfigurer) deconfigureAddress() bool {
 }
 
 func (c *BasicConfigurer) runAddressConfiguration(action string) bool {
-	cmd := exec.Command("ip", "addr", action,
+	cmd := execCommand("ip", "addr", action,
 		c.getCIDR(),
 		"dev", c.Iface.Name)
 	output, err := cmd.CombinedOutput()
