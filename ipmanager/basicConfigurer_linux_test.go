@@ -298,7 +298,7 @@ func TestBasicConfigurer_configureAddress_IPv6(t *testing.T) {
 			name:     "success",
 			iface:    net.Interface{Name: "lo"},
 			wantSend: true,
-			sendCheck: func(iface net.Interface, packetData []byte, protocol uint16) error {
+			sendCheck: func(_ net.Interface, _ []byte, protocol uint16) error {
 				if protocol != syscall.ETH_P_IPV6 {
 					t.Fatalf("wrong protocol: got %d want %d", protocol, syscall.ETH_P_IPV6)
 				}
@@ -309,7 +309,7 @@ func TestBasicConfigurer_configureAddress_IPv6(t *testing.T) {
 			name:     "no-link-local",
 			iface:    net.Interface{Name: "loopback-test"},
 			wantSend: false,
-			sendCheck: func(iface net.Interface, packetData []byte, protocol uint16) error {
+			sendCheck: func(_ net.Interface, _ []byte, _ uint16) error {
 				t.Fatal("send should not be called when no IPv6 link-local address is available")
 				return nil
 			},
@@ -319,7 +319,7 @@ func TestBasicConfigurer_configureAddress_IPv6(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mockLogger(t)
-			mockExecCommand(t, func(name string, args ...string) *exec.Cmd { return exec.Command("true") })
+			mockExecCommand(t, func(_ string, _ ...string) *exec.Cmd { return exec.Command("true") })
 			mockIPv6Send(t, tt.sendCheck)
 
 			c := &BasicConfigurer{
@@ -339,7 +339,7 @@ func TestBasicConfigurer_configureAddress_IPv6(t *testing.T) {
 
 func TestBasicConfigurer_runAddressConfiguration_ErrorExit(t *testing.T) {
 	mockLogger(t)
-	mockExecCommand(t, func(name string, args ...string) *exec.Cmd {
+	mockExecCommand(t, func(_ string, _ ...string) *exec.Cmd {
 		return exec.Command("sh", "-c", "exit 1")
 	})
 
