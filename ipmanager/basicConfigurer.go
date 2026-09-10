@@ -53,6 +53,9 @@ const (
 	IPv4AddressSize = 4
 )
 
+// serializePacketLayers serializes packet layers (mockable for testing).
+var serializePacketLayers = gopacket.SerializeLayers
+
 // createGratuitousNA prepares an unsolicited IPv6 Neighbor Advertisement.
 func (c *BasicConfigurer) createGratuitousNA(sourceIP net.IP) ([]byte, error) {
 	allNodes := net.ParseIP("ff02::1")
@@ -90,7 +93,7 @@ func (c *BasicConfigurer) createGratuitousNA(sourceIP net.IP) ([]byte, error) {
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	if err := gopacket.SerializeLayers(buffer, opts, ethLayer, ipv6Layer, icmpLayer, naLayer); err != nil {
+	if err := serializePacketLayers(buffer, opts, ethLayer, ipv6Layer, icmpLayer, naLayer); err != nil {
 		return nil, err
 	}
 
@@ -126,7 +129,7 @@ func (c *BasicConfigurer) createGratuitousARP() ([]byte, error) {
 		ComputeChecksums: true,
 	}
 
-	if err := gopacket.SerializeLayers(buffer, opts, ethLayer, arpLayer); err != nil {
+	if err := serializePacketLayers(buffer, opts, ethLayer, arpLayer); err != nil {
 		return nil, err
 	}
 

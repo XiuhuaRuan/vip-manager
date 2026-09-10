@@ -3,6 +3,8 @@
 package ipmanager
 
 import (
+	"bytes"
+	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -10,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"go.uber.org/zap"
 )
 
@@ -337,6 +341,193 @@ func TestBasicConfigurer_configureAddress_IPv6(t *testing.T) {
 	}
 }
 
+// TestBasicConfigurer_configureAddress_IPv6_RunAddrConfigFails verifies that
+// when runAddressConfiguration fails for an IPv6 VIP, configureAddress returns
+// false and never attempts to send a Neighbor Advertisement.
+func TestBasicConfigurer_configureAddress_IPv6_RunAddrConfigFails(t *testing.T) {
+	t.Parallel()
+	mockLogger(t)
+	mockExecCommand(t, func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", "exit 1")
+	})
+
+	sendCalled := false
+	mockIPv6Send(t, func(_ net.Interface, _ []byte, _ uint16) error {
+		sendCalled = true
+		t.Fatal("send should not be called when runAddressConfiguration fails")
+		return nil
+	})
+
+	c := &BasicConfigurer{
+		IPConfiguration: &IPConfiguration{
+			VIP:     netip.MustParseAddr("2001:db8::10"),
+			Netmask: net.CIDRMask(64, 128),
+			Iface:   net.Interface{Name: "lo"},
+		},
+	}
+
+	if got := c.configureAddress(); got {
+		t.Fatal("configureAddress() = true, want false when runAddressConfiguration fails")
+	}
+	if sendCalled {
+		t.Error("NA send was called despite runAddressConfiguration failure")
+	}
+}
+
+// TestBasicConfigurer_configureAddress_IPv6_SendNAFails verifies that
+// when the NA packet send fails, configureAddress still returns true
+// (the address was successfully added) and handles the error gracefully.
+func TestBasicConfigurer_configureAddress_IPv6_SendNAFails(t *testing.T) {
+	t.Parallel()
+	mockLogger(t)
+	mockExecCommand(t, func(_ string, _ ...string) *exec.Cmd { return exec.Command("true") })
+
+	sendErr := errors.New("mock send error: permission denied")
+	mockIPv6Send(t, func(_ net.Interface, _ []byte, protocol uint16) error {
+		if protocol != syscall.ETH_P_IPV6 {
+			t.Fatalf("wrong protocol: got %d want %d", protocol, syscall.ETH_P_IPV6)
+		}
+		return sendErr
+	})
+
+	c := &BasicConfigurer{
+		IPConfiguration: &IPConfiguration{
+			VIP:     netip.MustParseAddr("2001:db8::10"),
+			Netmask: net.CIDRMask(64, 128),
+			Iface:   net.Interface{Name: "lo"},
+		},
+	}
+
+	// configureAddress should still return true because the address was added
+	// successfully; the NA send failure only produces a warning log.
+	if got := c.configureAddress(); !got {
+		t.Fatal("configureAddress() = false, want true even when NA send fails")
+	}
+}
+
+func validateIPv6NAEthernetLayer(t *testing.T, packet []byte, hwAddr net.HardwareAddr) {
+	t.Helper()
+	parsed := gopacket.NewPacket(packet, layers.LayerTypeEthernet, gopacket.Default)
+	ethLayer := parsed.Layer(layers.LayerTypeEthernet)
+	if ethLayer == nil {
+		t.Fatal("missing Ethernet layer")
+	}
+	eth := ethLayer.(*layers.Ethernet)
+	wantMulticastMAC := net.HardwareAddr{0x33, 0x33, 0x00, 0x00, 0x00, 0x01}
+	if !bytes.Equal(eth.DstMAC, wantMulticastMAC) {
+		t.Errorf("Ethernet DstMAC = %v, want all-nodes multicast %v", eth.DstMAC, wantMulticastMAC)
+	}
+	if !bytes.Equal(eth.SrcMAC, hwAddr) {
+		t.Errorf("Ethernet SrcMAC = %v, want %v", eth.SrcMAC, hwAddr)
+	}
+	if eth.EthernetType != layers.EthernetTypeIPv6 {
+		t.Errorf("Ethernet EthernetType = %v, want IPv6", eth.EthernetType)
+	}
+}
+
+func validateIPv6NAIPv6Layer(t *testing.T, packet []byte) {
+	t.Helper()
+	parsed := gopacket.NewPacket(packet, layers.LayerTypeEthernet, gopacket.Default)
+	ipv6Layer := parsed.Layer(layers.LayerTypeIPv6)
+	if ipv6Layer == nil {
+		t.Fatal("missing IPv6 layer")
+	}
+	ipv6 := ipv6Layer.(*layers.IPv6)
+	if ipv6.Version != 6 {
+		t.Errorf("IPv6 Version = %d, want 6", ipv6.Version)
+	}
+	if ipv6.HopLimit != 255 {
+		t.Errorf("IPv6 HopLimit = %d, want 255", ipv6.HopLimit)
+	}
+	if ipv6.NextHeader != layers.IPProtocolICMPv6 {
+		t.Errorf("IPv6 NextHeader = %v, want ICMPv6", ipv6.NextHeader)
+	}
+	allNodes := net.ParseIP("ff02::1")
+	if !ipv6.DstIP.Equal(allNodes) {
+		t.Errorf("IPv6 DstIP = %s, want %s", ipv6.DstIP, allNodes)
+	}
+	if ipv6.SrcIP == nil || !ipv6.SrcIP.IsLinkLocalUnicast() {
+		t.Errorf("IPv6 SrcIP = %s, want a link-local address", ipv6.SrcIP)
+	}
+}
+
+func validateIPv6NAICMPv6Layer(t *testing.T, packet []byte) {
+	t.Helper()
+	parsed := gopacket.NewPacket(packet, layers.LayerTypeEthernet, gopacket.Default)
+	icmpLayer := parsed.Layer(layers.LayerTypeICMPv6)
+	if icmpLayer == nil {
+		t.Fatal("missing ICMPv6 layer")
+	}
+	icmp := icmpLayer.(*layers.ICMPv6)
+	if icmp.TypeCode.Type() != layers.ICMPv6TypeNeighborAdvertisement {
+		t.Errorf("ICMPv6 Type = %v, want NA (%d)", icmp.TypeCode.Type(), layers.ICMPv6TypeNeighborAdvertisement)
+	}
+}
+
+func validateIPv6NANeighborAdvertisementLayer(t *testing.T, packet []byte, vipAddr netip.Addr, hwAddr net.HardwareAddr) {
+	t.Helper()
+	parsed := gopacket.NewPacket(packet, layers.LayerTypeEthernet, gopacket.Default)
+	naLayer := parsed.Layer(layers.LayerTypeICMPv6NeighborAdvertisement)
+	if naLayer == nil {
+		t.Fatal("missing ICMPv6NeighborAdvertisement layer")
+	}
+	na := naLayer.(*layers.ICMPv6NeighborAdvertisement)
+	if na.Flags&0x20 == 0 {
+		t.Errorf("NA Override flag not set, flags = 0x%x", na.Flags)
+	}
+	wantVIP := vipAddr.AsSlice()
+	if !net.IP(na.TargetAddress).Equal(net.IP(wantVIP)) {
+		t.Errorf("NA TargetAddress = %s, want %s", na.TargetAddress, vipAddr)
+	}
+	if len(na.Options) != 1 {
+		t.Fatalf("NA Options length = %d, want 1", len(na.Options))
+	}
+	if na.Options[0].Type != layers.ICMPv6OptTargetAddress {
+		t.Errorf("NA Option Type = %v, want TargetLinkLayerAddress", na.Options[0].Type)
+	}
+	if !bytes.Equal(na.Options[0].Data, hwAddr) {
+		t.Errorf("NA Option Data = %v, want MAC %v", na.Options[0].Data, hwAddr)
+	}
+}
+
+// TestBasicConfigurer_configureAddress_IPv6_NAPacketContent validates the
+// full content of the unsolicited Neighbor Advertisement packet that is sent
+// after a new IPv6 address is bound to the interface.
+func TestBasicConfigurer_configureAddress_IPv6_NAPacketContent(t *testing.T) {
+	t.Parallel()
+	mockLogger(t)
+	mockExecCommand(t, func(_ string, _ ...string) *exec.Cmd { return exec.Command("true") })
+
+	vipAddr := netip.MustParseAddr("2001:db8::10")
+	hwAddr := net.HardwareAddr{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
+
+	mockIPv6Send(t, func(_ net.Interface, packet []byte, protocol uint16) error {
+		if protocol != syscall.ETH_P_IPV6 {
+			t.Fatalf("protocol = %d, want ETH_P_IPV6 (%d)", protocol, syscall.ETH_P_IPV6)
+		}
+		validateIPv6NAEthernetLayer(t, packet, hwAddr)
+		validateIPv6NAIPv6Layer(t, packet)
+		validateIPv6NAICMPv6Layer(t, packet)
+		validateIPv6NANeighborAdvertisementLayer(t, packet, vipAddr, hwAddr)
+		return nil
+	})
+
+	c := &BasicConfigurer{
+		IPConfiguration: &IPConfiguration{
+			VIP:     vipAddr,
+			Netmask: net.CIDRMask(64, 128),
+			Iface: net.Interface{
+				Name:         "lo",
+				HardwareAddr: hwAddr,
+			},
+		},
+	}
+
+	if got := c.configureAddress(); !got {
+		t.Fatal("configureAddress() = false, want true")
+	}
+}
+
 func TestBasicConfigurer_runAddressConfiguration_ErrorExit(t *testing.T) {
 	mockLogger(t)
 	mockExecCommand(t, func(_ string, _ ...string) *exec.Cmd {
@@ -353,6 +544,92 @@ func TestBasicConfigurer_runAddressConfiguration_ErrorExit(t *testing.T) {
 
 	if c.runAddressConfiguration("add") {
 		t.Fatal("runAddressConfiguration() = true, want false")
+	}
+}
+
+// TestBasicConfigurer_configureAddress_IPv4_MockedSend verifies the IPv4 branch
+// of configureAddress: after a successful address add, a gratuitous ARP is
+// composed and sent on the interface.
+func TestBasicConfigurer_configureAddress_IPv4_MockedSend(t *testing.T) {
+	t.Parallel()
+	mockLogger(t)
+	mockExecCommand(t, func(_ string, _ ...string) *exec.Cmd { return exec.Command("true") })
+
+	vipAddr := netip.MustParseAddr("192.168.1.100")
+	hwAddr := net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
+
+	old := linuxSendPacketWithProtocolFn
+	linuxSendPacketWithProtocolFn = func(_ net.Interface, packet []byte, protocol uint16) error {
+		if protocol != syscall.ETH_P_ARP {
+			t.Errorf("protocol = %d, want ETH_P_ARP (%d)", protocol, syscall.ETH_P_ARP)
+		}
+		parsed := gopacket.NewPacket(packet, layers.LayerTypeEthernet, gopacket.Default)
+		ethLayer := parsed.Layer(layers.LayerTypeEthernet)
+		if ethLayer == nil {
+			t.Fatal("missing Ethernet layer in ARP packet")
+		}
+		eth := ethLayer.(*layers.Ethernet)
+		if eth.EthernetType != layers.EthernetTypeARP {
+			t.Errorf("Ethernet type = %v, want ARP", eth.EthernetType)
+		}
+		arpLayer := parsed.Layer(layers.LayerTypeARP)
+		if arpLayer == nil {
+			t.Fatal("missing ARP layer")
+		}
+		arp := arpLayer.(*layers.ARP)
+		if !bytes.Equal(arp.SourceProtAddress, vipAddr.AsSlice()) {
+			t.Errorf("ARP SourceProtAddress = %v, want %v", arp.SourceProtAddress, vipAddr.AsSlice())
+		}
+		if !bytes.Equal(arp.SourceHwAddress, hwAddr) {
+			t.Errorf("ARP SourceHwAddress = %v, want %v", arp.SourceHwAddress, hwAddr)
+		}
+		return nil
+	}
+	t.Cleanup(func() { linuxSendPacketWithProtocolFn = old })
+
+	c := &BasicConfigurer{
+		IPConfiguration: &IPConfiguration{
+			VIP:     vipAddr,
+			Netmask: net.CIDRMask(24, 32),
+			Iface: net.Interface{
+				Name:         "lo",
+				HardwareAddr: hwAddr,
+			},
+		},
+	}
+
+	if got := c.configureAddress(); !got {
+		t.Fatal("configureAddress() = false, want true")
+	}
+}
+
+// TestBasicConfigurer_configureAddress_IPv4_SendARPFails verifies that when the
+// gratuitous ARP send fails, configureAddress still returns true and handles
+// the error gracefully via a warning log.
+func TestBasicConfigurer_configureAddress_IPv4_SendARPFails(t *testing.T) {
+	t.Parallel()
+	mockLogger(t)
+	mockExecCommand(t, func(_ string, _ ...string) *exec.Cmd { return exec.Command("true") })
+
+	old := linuxSendPacketWithProtocolFn
+	linuxSendPacketWithProtocolFn = func(_ net.Interface, _ []byte, _ uint16) error {
+		return errors.New("mock ARP send error")
+	}
+	t.Cleanup(func() { linuxSendPacketWithProtocolFn = old })
+
+	c := &BasicConfigurer{
+		IPConfiguration: &IPConfiguration{
+			VIP:     netip.MustParseAddr("192.168.1.100"),
+			Netmask: net.CIDRMask(24, 32),
+			Iface: net.Interface{
+				Name:         "lo",
+				HardwareAddr: net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
+			},
+		},
+	}
+
+	if got := c.configureAddress(); !got {
+		t.Fatal("configureAddress() = false, want true even when ARP send fails")
 	}
 }
 
