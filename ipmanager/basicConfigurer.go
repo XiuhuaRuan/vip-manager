@@ -25,7 +25,7 @@ func newBasicConfigurer(config *IPConfiguration) (*BasicConfigurer, error) {
 	if c.Iface.HardwareAddr == nil || c.Iface.HardwareAddr.String() == "00:00:00:00:00:00" {
 		return nil, errors.New(`cannot run vip-manager on the loopback device
 as its hardware address is the local address (00:00:00:00:00:00),
-which prohibits sending of gratuitous ARP messages`)
+which prohibits sending of gratuitous ARP messages and IPv6 Neighbor Advertisements`)
 	}
 	return c, nil
 }
@@ -53,7 +53,8 @@ const (
 	IPv4AddressSize = 4
 )
 
-// serializePacketLayers serializes packet layers (mockable for testing).
+// serializePacketLayers is gopacket.SerializeLayers, kept in a variable so
+// tests can force a serialization failure.
 var serializePacketLayers = gopacket.SerializeLayers
 
 // createGratuitousNA prepares an unsolicited IPv6 Neighbor Advertisement.
@@ -102,6 +103,9 @@ func (c *BasicConfigurer) createGratuitousNA(sourceIP net.IP) ([]byte, error) {
 
 // createGratuitousARP prepares a packet with a gratuitous ARP request
 func (c *BasicConfigurer) createGratuitousARP() ([]byte, error) {
+	// Unmap so that a ::ffff:a.b.c.d VIP yields the 4 bytes ProtAddressSize promises.
+	vip := c.VIP.Unmap().AsSlice()
+
 	// Create the Ethernet layer
 	ethLayer := &layers.Ethernet{
 		SrcMAC:       c.Iface.HardwareAddr,
@@ -117,9 +121,9 @@ func (c *BasicConfigurer) createGratuitousARP() ([]byte, error) {
 		ProtAddressSize:   IPv4AddressSize,
 		Operation:         layers.ARPReply, // Gratuitous ARP is sent as a reply
 		SourceHwAddress:   c.Iface.HardwareAddr,
-		SourceProtAddress: c.VIP.AsSlice(),
+		SourceProtAddress: vip,
 		DstHwAddress:      c.Iface.HardwareAddr, // Gratuitous ARP targets itself
-		DstProtAddress:    c.VIP.AsSlice(),
+		DstProtAddress:    vip,
 	}
 
 	// Create a packet with the layers
